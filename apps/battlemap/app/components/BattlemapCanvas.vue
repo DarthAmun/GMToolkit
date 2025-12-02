@@ -1,81 +1,81 @@
 <script setup lang="ts">
 import { Application, Assets, Container, Graphics, Sprite } from "pixi.js";
-import { ref, onMounted } from "vue";
+import { ref, onMounted, watch } from "vue";
 
-const { $pixi } = useNuxtApp();
+const props = defineProps<{
+    map: any;
+}>();
+
+interface DraggableSprite extends Sprite {
+    offset?: { x: number; y: number };
+    tokenId?: string;
+}
+
+const { $api } = useNuxtApp();
 
 const containerRef = ref<HTMLDivElement | null>(null);
-const tokenUrl = ref('');
-const mapUrl = ref('');
-const draggingSprite = ref();
 
-const gridSize = ref(50); // in pixels, adjustable
-
+const gridSize = ref(50);
 let app: any = new Application();
+
 const mapContainer = new Container();
 const gridContainer = new Container();
+let mapSprite: Sprite | null = null;
 
-let mapSprite: Sprite;
-const tokens: Sprite[] = []; // store all tokens
+const tokens: Sprite[] = [];
+let draggedToken: DraggableSprite | null = null;
 
-let draggingMap = false; // map dragging state
-
-let draggedToken: Sprite | null = null;
-let offsetX = 0;
-let offsetY = 0;
-
-// Pan variables
-let dragging = false;
+let draggingMap = false;
 let dragStart = { x: 0, y: 0 };
 let mapStart = { x: 0, y: 0 };
 
-// Zoom variables
 let scale = 1;
 const minScale = 0.1;
 const maxScale = 3;
 
+/* --------------------------------------------
+   LOAD MAP + PIXI SETUP
+-------------------------------------------- */
 onMounted(async () => {
-    // Initialize Pixi application
     await app.init({
         resizeTo: containerRef.value!,
         background: "#1e1e1e",
         antialias: true,
     });
 
-    // Append canvas
     containerRef.value!.appendChild(app.canvas);
 
-    // ... set up world container, grid, pan/zoom, etc.
     app.stage.addChild(mapContainer);
 
-    // --- Pan ---
+    // --- PAN ---
     app.stage.interactive = true;
-    // --- Stage pointerdown ---
-    app.stage.on('pointerdown', (event: any) => {
-        const target = event.target; // PIXI object under cursor
+
+    app.stage.on("pointerdown", (event: any) => {
+        const target = event.target;
 
         if (tokens.includes(target)) {
-            // Start dragging token
-            draggedToken = target as Sprite;
+            // drag token
+            draggedToken = target;
+            if (!draggedToken) return;
+
             const pos = event.data.getLocalPosition(draggedToken.parent);
-            offsetX = pos.x - draggedToken.x;
-            offsetY = pos.y - draggedToken.y;
+            draggedToken.offset = {
+                x: pos.x - draggedToken.x,
+                y: pos.y - draggedToken.y,
+            };
         } else {
-            // Start dragging map
+            // drag map
             draggingMap = true;
-            dragStart.x = event.data.global.x;
-            dragStart.y = event.data.global.y;
-            mapStart.x = mapContainer.x;
-            mapStart.y = mapContainer.y;
+            dragStart = { x: event.data.global.x, y: event.data.global.y };
+            mapStart = { x: mapContainer.x, y: mapContainer.y };
         }
     });
 
-    // --- Stage pointermove ---
-    app.stage.on('pointermove', (event: any) => {
+    app.stage.on("pointermove", (event: any) => {
         if (draggedToken) {
             const pos = event.data.getLocalPosition(draggedToken.parent);
-            draggedToken.x = pos.x - offsetX;
-            draggedToken.y = pos.y - offsetY;
+            draggedToken.x = pos.x - (draggedToken.offset?.x ?? 0);
+            draggedToken.y = pos.y - (draggedToken.offset?.y ?? 0);
         } else if (draggingMap) {
             const dx = event.data.global.x - dragStart.x;
             const dy = event.data.global.y - dragStart.y;
@@ -84,23 +84,26 @@ onMounted(async () => {
         }
     });
 
-    // --- Stage pointerup / pointerupoutside ---
-    const stopDrag = () => {
+    const stopDrag = async () => {
         if (draggedToken) {
             draggedToken.x = Math.round(draggedToken.x / gridSize.value) * gridSize.value;
             draggedToken.y = Math.round(draggedToken.y / gridSize.value) * gridSize.value;
-            draggedToken = null;
+
+            await updateBackendTokenPosition(draggedToken);
         }
+
+        draggedToken = null;
         draggingMap = false;
     };
 
-    app.stage.on('pointerup', stopDrag);
-    app.stage.on('pointerupoutside', stopDrag);
+    app.stage.on("pointerup", stopDrag);
+    app.stage.on("pointerupoutside", stopDrag);
 
-    // --- Zoom ---
-    containerRef.value!.addEventListener('wheel', (e: WheelEvent) => {
+    // --- ZOOM ---
+    containerRef.value!.addEventListener("wheel", (e: WheelEvent) => {
         e.preventDefault();
         const oldScale = scale;
+
         scale *= e.deltaY < 0 ? 1.1 : 0.9;
         scale = Math.min(Math.max(scale, minScale), maxScale);
 
@@ -114,126 +117,151 @@ onMounted(async () => {
 
         mapContainer.x = mouseX - worldPos.x * scale;
         mapContainer.y = mouseY - worldPos.y * scale;
-
         mapContainer.scale.set(scale);
     });
+
+    // ★ Load map from backend
+    await loadMapImage();
+
+    // ★ Load map tokens
+    await loadBackendTokens();
 });
 
-const addMap = async () => {
-    const texture = await Assets.load(mapUrl.value);
+/* --------------------------------------------
+   LOAD MAP IMAGE FROM BACKEND
+-------------------------------------------- */
+const loadMapImage = async () => {
+    if (!props.map?.imageUrl) return;
+
+    const texture = await Assets.load(props.map.imageUrl);
     mapSprite = new Sprite(texture);
-    mapContainer.addChildAt(mapSprite, 0); // behind grid
+
+    mapContainer.addChildAt(mapSprite, 0);
     mapContainer.addChildAt(gridContainer, 1);
 
     drawGrid();
-}
+};
 
-const addToken = async () => {
-    const texture = await Assets.load(tokenUrl.value);
-    const token = new Sprite(texture);
+/* --------------------------------------------
+   LOAD TOKENS FROM BACKEND
+-------------------------------------------- */
+const loadBackendTokens = async () => {
+    if (!props.map?.tokens) return;
 
-    token.width = gridSize.value;
-    token.height = gridSize.value;
+    for (const mt of props.map.tokens) {
+        const texture = await Assets.load(mt.token.image);
+        const sprite = new Sprite(texture);
 
-    // Snap to grid at (0,0) initially
-    token.x = 0;
-    token.y = 0;
+        sprite.width = gridSize.value;
+        sprite.height = gridSize.value;
+        sprite.x = mt.x;
+        sprite.y = mt.y;
 
-    token.interactive = true;
-    token.cursor = "pointer"; // show pointer cursor on hover
+        sprite.interactive = true;
+        sprite.cursor = "pointer";
 
-    let offsetX = 0;
-    let offsetY = 0;
+        (sprite as any).mapTokenId = mt.id;
 
-    token.on('pointerdown', (event: any) => {
+        enableTokenDragging(sprite);
+
+        tokens.push(sprite);
+        mapContainer.addChild(sprite);
+    }
+};
+
+/* --------------------------------------------
+   DRAG TOKEN LOGIC
+-------------------------------------------- */
+const enableTokenDragging = (token: Sprite) => {
+    token.on("pointerdown", (event: any) => {
         const pos = event.data.getLocalPosition(token.parent);
-        offsetX = pos.x - token.x;
-        offsetY = pos.y - token.y;
-        draggedToken = token; // start dragging
-        draggingSprite.value = true; // optional, if you use this flag
+        draggedToken = token;
+        draggedToken.offset = {
+            x: pos.x - token.x,
+            y: pos.y - token.y,
+        };
     });
 
-    token.on('pointermove', (event: any) => {
-        if (!draggingSprite.value) return;
-        const pos = event.data.getLocalPosition(token.parent);
-        token.x = pos.x - offsetX;
-        token.y = pos.y - offsetY;
+    token.on("pointerup", async () => {
+        if (!draggedToken) return;
+
+        draggedToken.x = Math.round(draggedToken.x / gridSize.value) * gridSize.value;
+        draggedToken.y = Math.round(draggedToken.y / gridSize.value) * gridSize.value;
+
+        await updateBackendTokenPosition(draggedToken);
+        draggedToken = null;
     });
 
-    token.on('pointerup', () => {
-        draggingSprite.value = false;
-        token.x = Math.round(token.x / gridSize.value) * gridSize.value;
-        token.y = Math.round(token.y / gridSize.value) * gridSize.value;
+    token.on("pointerupoutside", () => (draggedToken = null));
+};
+
+/* --------------------------------------------
+   UPDATE TOKEN POSITION IN BACKEND
+-------------------------------------------- */
+const updateBackendTokenPosition = async (token: Sprite) => {
+    const mapTokenId = (token as any).mapTokenId;
+    if (!mapTokenId) return;
+
+    await $api(`/maps/token/${mapTokenId}`, {
+        method: "PATCH",
+        body: {
+            x: token.x,
+            y: token.y,
+        },
     });
+};
 
-    token.on('pointerupoutside', () => {
-        draggingSprite.value = false;
-        token.x = Math.round(token.x / gridSize.value) * gridSize.value;
-        token.y = Math.round(token.y / gridSize.value) * gridSize.value;
-    });
-
-    tokens.push(token); // store token
-    mapContainer.addChildAt(token, 2);
-}
-
+/* --------------------------------------------
+   GRID
+-------------------------------------------- */
 const drawGrid = () => {
-    if (!mapSprite) return; // no map yet
+    if (!mapSprite) return;
 
     gridContainer.removeChildren();
 
     const g = new Graphics();
     g.setStrokeStyle({ width: 1, color: 0xffffff, alpha: 0.3 });
 
-    const mapWidth = mapSprite.width;
-    const mapHeight = mapSprite.height;
+    const w = mapSprite.width;
+    const h = mapSprite.height;
     const step = gridSize.value;
 
-    // Vertical lines
-    for (let x = 0; x <= mapWidth; x += step) {
+    for (let x = 0; x <= w; x += step) {
         g.moveTo(x, 0);
-        g.lineTo(x, mapHeight);
+        g.lineTo(x, h);
     }
-
-    // Horizontal lines
-    for (let y = 0; y <= mapHeight; y += step) {
+    for (let y = 0; y <= h; y += step) {
         g.moveTo(0, y);
-        g.lineTo(mapWidth, y);
+        g.lineTo(w, y);
     }
 
     g.stroke();
-
     gridContainer.addChild(g);
 };
 
-watch(gridSize, (newSize) => {
-    drawGrid(); // redraw grid
+watch(gridSize, () => {
+    drawGrid();
 
-    // resize all tokens to match new grid size
-    tokens.forEach(token => {
-        token.width = newSize;
-        token.height = newSize;
+    tokens.forEach((t) => {
+        t.width = gridSize.value;
+        t.height = gridSize.value;
 
-        // optionally snap token to new grid
-        token.x = Math.round(token.x / newSize) * newSize;
-        token.y = Math.round(token.y / newSize) * newSize;
+        t.x = Math.round(t.x / gridSize.value) * gridSize.value;
+        t.y = Math.round(t.y / gridSize.value) * gridSize.value;
     });
 });
 </script>
 
 <template>
-    <input v-model="mapUrl" />
-    <button @click="addMap">loadMap</button>
-    <input v-model="tokenUrl" />
-    <button @click="addToken">loadSprite</button>
-    <input v-model="gridSize" type="number" />
-    <div ref="containerRef" class="w-full h-full border rounded overflow-hidden"></div>
+    <div class="relative">
+        <div class="fixed top-0 left-0 flex gap-2 p-2 shadow-md bg-[#1d1f1d] rounded">
+            <NuxtLink to="/"><v-icon name="gi-axe-sword" />Battlemap</NuxtLink>
+        </div>
+        <div class="fixed bottom-0 left-0 flex gap-2 p-2 shadow-md bg-[#1d1f1d] rounded">
+            <input v-model="gridSize" type="number" />
+        </div>
+        <div ref="containerRef" class="w-[100vw] h-[100vh] rounded overflow-hidden"></div>
+    </div>
 </template>
 
-<style scoped>
-div {
-    width: 100%;
-    height: 80vh;
-    /* adjust as needed */
-    overflow: hidden;
-}
-</style>
+<style scoped></style>
