@@ -1,0 +1,6 @@
+packages:
+  - "apps/backend"
+  - "apps/battlemap"
+  - "apps/sessionplaner"
+  - "apps/worldbuilder"
+  - "packages/*"
